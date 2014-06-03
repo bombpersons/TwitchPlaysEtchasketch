@@ -40,6 +40,10 @@ int clearcounter = 0;
 int cursorx, cursory;
 Pixel cursorColor;
 
+Pixel* GetPixel(int _x, int _y) {
+  return &pixels[_x + _y * width];
+}
+
 // The generate the ffmpeg command for streaming.
 FILE* GetFfmpegPipe(const char* _key, int _fps) {
   std::stringstream s;
@@ -60,6 +64,16 @@ FILE* GetFfmpegPipe(const char* _key, int _fps) {
   return ffmpeg;
 }
 
+// Clear the screen
+void ClearScreen() {
+  std::lock_guard<std::mutex> lock(framemutex);
+  for (int i = 0; i < width*height; ++i)
+    pixels[i] = Pixel(255, 255, 255, 0);
+
+  *GetPixel(cursorx, cursory) = cursorColor;
+  clearcounter = 0;
+}
+
 // Create the screen
 void CreateScreen(int _framewidth, int _frameheight, int _width, int _height) {
   width = _width;
@@ -68,23 +82,11 @@ void CreateScreen(int _framewidth, int _frameheight, int _width, int _height) {
   framewidth = _framewidth;
   frameheight = _frameheight;
 
+  cursorx = width/2;
+  cursory = height/2;
+
   // Clear the color to a white color
-  for (int i = 0; i < _width*_height; ++i)
-    pixels[i] = Pixel(255, 255, 255, 0);
-}
-
-Pixel* GetPixel(int _x, int _y) {
-  return &pixels[_x + _y * width];
-}
-
-void ClearScreen() {
-  framemutex.lock();
-  for (int i = 0; i < width*height; ++i)
-    pixels[i] = Pixel(255, 255, 255, 0);
-
-  *GetPixel(cursorx, cursory) = cursorColor;
-  clearcounter = 0;
-  framemutex.unlock();
+  ClearScreen();
 }
 
 // Move the cursor
@@ -96,7 +98,8 @@ void MoveCursor(int _dx, int _dy) {
       newy < 0 || newy >= height)
       return;
 
-  framemutex.lock();
+  // Lock
+  std::lock_guard<std::mutex> lock(framemutex);
 
   // Moving
   std::cout << "Moving cursor by " << _dx << ", " << _dy << std::endl;
@@ -110,15 +113,12 @@ void MoveCursor(int _dx, int _dy) {
 
   // Change the color of the cursor to red (to show where it is)
   *GetPixel(cursorx, cursory) = cursorColor;
-
-  framemutex.unlock();
 }
 
 // Encode a frame.
 void WriteFrame(FILE* _ffmpeg) {
-  framemutex.lock();
+  std::lock_guard<std::mutex> lock(framemutex);
   fwrite(pixels, sizeof(Pixel) * width * height, 1, _ffmpeg);
-  framemutex.unlock();
 }
 
 // Reads the chat for input.
@@ -247,14 +247,11 @@ int main(int _argc, char** _argv) {
     return 1;
   }
 
+  // Cursor color
+  cursorColor = Pixel(255, 0, 0, 0);
+
   // Create the screen.
   CreateScreen(1280, 720, 128, 72);
-
-  // Set the cursor
-  cursorx = width/2;
-  cursory = height/2;
-  cursorColor = Pixel(255, 0, 0, 0);
-  *GetPixel(cursorx, cursory) = cursorColor;
 
   // Run the irc bot
   ircuser = _argv[1];
@@ -271,10 +268,11 @@ int main(int _argc, char** _argv) {
   typedef std::chrono::high_resolution_clock Clock;
   auto oldticks = Clock::now();
   while (true) {
-    float timer = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - oldticks).count() / 1000000000.0f;
+    //float timer = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - oldticks).count() / 1000000000.0f;
+    std::this_thread::sleep_for(std::chrono::nanoseconds((long int)(1000000000 * (1.0f / fps))));
 
     // Write frames at the right timing.
-    if (timer > 1.0f / fps) {
+    if (true) {
       oldticks = Clock::now();
 
       //MoveCursor(-1 + rand() % 3, -1 + rand() % 3);

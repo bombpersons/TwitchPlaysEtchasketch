@@ -8,6 +8,7 @@
 #include <cstring>
 #include <netdb.h>
 #include <ctime>
+#include <chrono>
 
 // Threads for handling the chat
 #include <thread>
@@ -16,23 +17,115 @@
 // For the list of moves
 #include <vector>
 
+// The screen
+struct Pixel {
+  Pixel() {}
+  Pixel(unsigned char _r, unsigned char _g, unsigned char _b, unsigned char _a) {
+    r = _r;
+    g = _g;
+    b = _b;
+    a = _a;
+  }
+  unsigned char r, g, b, a;
+};
+Pixel* pixels;
+int width, height;
+int framewidth, frameheight;
+int pixelsize;
+
+std::mutex framemutex;
+int clearcounter = 0;
+
+// The location of the cursor
+int cursorx, cursory;
+Pixel cursorColor;
+
+// The generate the ffmpeg command for streaming.
+FILE* GetFfmpegPipe(const char* _key, int _fps) {
+  std::stringstream s;
+  s << "ffmpeg -f rawvideo -pix_fmt rgba -s " << width << "x" << height
+    << " -r " << _fps << " -i - -f flv -vcodec libx264 -g " << _fps * 2
+    << " -keyint_min " << _fps << " -b:v 1000k -minrate 1000k -maxrate 1000k -pix_fmt yuv420p"
+    << " -s " << framewidth << "x" << frameheight << " -sws_flags neighbor -preset ultrafast -tune film"
+    << " -threads 0 -strict normal -bufsize 1000k \"rtmp://live-ams.twitch.tv/app/" << _key << "\"";
+
+  // Open up a pipe to ffmpeg.
+  // (http://blog.mmacklin.com/2013/06/11/real-time-video-capture-with-ffmpeg/http://blog.mmacklin.com/2013/06/11/real-time-video-capture-with-ffmpeg/)
+  FILE* ffmpeg = popen(s.str().c_str(), "w");
+  if (ffmpeg == NULL) {
+    std::cout << "Couldn't open FFMPEG. Error: " << errno << std::endl;
+    return NULL;
+  }
+
+  return ffmpeg;
+}
+
+// Create the screen
+void CreateScreen(int _framewidth, int _frameheight, int _width, int _height) {
+  width = _width;
+  height = _height;
+  pixels = new Pixel[_width*_height];
+  framewidth = _framewidth;
+  frameheight = _frameheight;
+
+  // Clear the color to a white color
+  for (int i = 0; i < _width*_height; ++i)
+    pixels[i] = Pixel(255, 255, 255, 0);
+}
+
+Pixel* GetPixel(int _x, int _y) {
+  return &pixels[_x + _y * width];
+}
+
+void ClearScreen() {
+  framemutex.lock();
+  for (int i = 0; i < width*height; ++i)
+    pixels[i] = Pixel(255, 255, 255, 0);
+
+  *GetPixel(cursorx, cursory) = cursorColor;
+  clearcounter = 0;
+  framemutex.unlock();
+}
+
+// Move the cursor
+void MoveCursor(int _dx, int _dy) {
+  // Check if it's possible
+  int newx = cursorx + _dx;
+  int newy = cursory + _dy;
+  if (newx < 0 || newx >= width ||
+      newy < 0 || newy >= height)
+      return;
+
+  framemutex.lock();
+
+  // Moving
+  std::cout << "Moving cursor by " << _dx << ", " << _dy << std::endl;
+
+  // Change the pixel underneath the cursor to black
+  *GetPixel(cursorx, cursory) = Pixel(0, 0, 0, 0);
+
+  // Move the cursor
+  cursorx = newx;
+  cursory = newy;
+
+  // Change the color of the cursor to red (to show where it is)
+  *GetPixel(cursorx, cursory) = cursorColor;
+
+  framemutex.unlock();
+}
+
+// Encode a frame.
+void WriteFrame(FILE* _ffmpeg) {
+  framemutex.lock();
+  fwrite(pixels, sizeof(Pixel) * width * height, 1, _ffmpeg);
+  framemutex.unlock();
+}
+
 // Reads the chat for input.
 char* ircuser;
 char* ircauth;
 int conn;
 char sbuf[512];
-
-// The move queue
-struct Movement {
-  Movement(int _dx, int _dy) {
-    dx = _dx;
-    dy = _dy;
-  }
-  int dx, dy;
-};
-std::vector<Movement> moves;
-std::mutex movesmutex;
-int clearcounter = 0;
 
 void raw(char *fmt, ...) {
     va_list ap;
@@ -48,23 +141,20 @@ void parsechat(char* _message) {
   if (_message == NULL)
     return;
 
-  // This function will be locked whilst updating the screen.
-  movesmutex.lock();
-
   // Figure out what kind of message it is.
   if (strstr(_message, "up") != 0)
-    moves.push_back(Movement(0, -1));
+    MoveCursor(0, -1);
   else if (strstr(_message, "down") != 0)
-    moves.push_back(Movement(0, 1));
+    MoveCursor(0, 1);
   else if (strstr(_message, "left") != 0)
-    moves.push_back(Movement(-1, 0));
+    MoveCursor(-1, 0);
   else if (strstr(_message, "right") != 0)
-    moves.push_back(Movement(1, 0));
-  else if (strstr(_message, "clear") != 0)
+    MoveCursor(1, 0);
+  else if (strstr(_message, "clear") != 0) {
     clearcounter += 1;
-
-  // Unlock
-  movesmutex.unlock();
+    if (clearcounter > 10)
+      ClearScreen();
+  }
 }
 
 int runchat() {
@@ -149,131 +239,6 @@ int runchat() {
 
 }
 
-
-// The screen
-struct Pixel {
-  Pixel() {}
-  Pixel(unsigned char _r, unsigned char _g, unsigned char _b, unsigned char _a) {
-    r = _r;
-    g = _g;
-    b = _b;
-    a = _a;
-  }
-  unsigned char r, g, b, a;
-};
-Pixel* pixels;
-Pixel* framepixels;
-int width, height;
-int framewidth, frameheight;
-int pixelsize;
-
-// The location of the cursor
-int cursorx, cursory;
-Pixel cursorColor;
-
-// The generate the ffmpeg command for streaming.
-FILE* GetFfmpegPipe(const char* _key, int _width, int _height, int _fps) {
-  std::stringstream s;
-  s << "ffmpeg -f rawvideo -pix_fmt rgba -s " << _width << "x" << _height << " "
-    << "-r " << _fps << " -i - -f flv -vcodec libx264 -g " << _fps * 2 << " "
-    << "-keyint_min " << _fps << " -b:v 1000k -minrate 1000k -maxrate 1000k -pix_fmt yuv420p "
-    << "-s " << _width << "x" << _height << " -preset ultrafast -tune film "
-    << "-threads 0 -strict normal -bufsize 1000k \"rtmp://live-ams.twitch.tv/app/" << _key << "\"";
-
-  // Open up a pipe to ffmpeg.
-  // (http://blog.mmacklin.com/2013/06/11/real-time-video-capture-with-ffmpeg/http://blog.mmacklin.com/2013/06/11/real-time-video-capture-with-ffmpeg/)
-  FILE* ffmpeg = popen(s.str().c_str(), "w");
-  if (ffmpeg == NULL) {
-    std::cout << "Couldn't open FFMPEG. Error: " << errno << std::endl;
-    return NULL;
-  }
-
-  return ffmpeg;
-}
-
-// Create the screen
-void CreateScreen(int _framewidth, int _frameheight, int _width, int _height) {
-  width = _width;
-  height = _height;
-  pixels = new Pixel[_width*_height];
-
-  framewidth = _framewidth;
-  frameheight = _frameheight;
-  framepixels = new Pixel[_framewidth*_frameheight];
-
-
-  // Clear the color to a white color
-  for (int i = 0; i < _width*_height; ++i)
-    pixels[i] = Pixel(255, 255, 255, 0);
-}
-
-Pixel* GetPixel(int _x, int _y) {
-  return &pixels[_x + _y * width];
-}
-
-// Move the cursor
-void MoveCursor(int _dx, int _dy) {
-  // Check if it's possible
-  int newx = cursorx + _dx;
-  int newy = cursory + _dy;
-  if (newx < 0 || newx >= width ||
-      newy < 0 || newy >= height)
-      return;
-
-  // Change the pixel underneath the cursor to black
-  *GetPixel(cursorx, cursory) = Pixel(0, 0, 0, 0);
-
-  // Move the cursor
-  cursorx = newx;
-  cursory = newy;
-
-  // Change the color of the cursor to red (to show where it is)
-  *GetPixel(cursorx, cursory) = cursorColor;
-}
-
-// Do queued movement
-void DoMovement() {
-  // Lock
-  movesmutex.lock();
-
-  // Check if we should clear
-  if (clearcounter > 10) {
-    for (int i = 0; i < width*height; ++i)
-      pixels[i] = Pixel(255, 255, 255, 0);
-
-    *GetPixel(cursorx, cursory) = cursorColor;
-    clearcounter = 0;
-  }
-
-  // Move all the queued up moves.
-  for (int i = 0; i < moves.size(); ++i) {
-    MoveCursor(moves[i].dx, moves[i].dy);
-  }
-
-  // Clear the moves
-  moves.clear();
-
-  // Unlock
-  movesmutex.unlock();
-}
-
-// Encode a frame.
-void WriteFrame(FILE* _ffmpeg) {
-  // Scale up.
-  float xratio = (float)width / (float)framewidth;
-  float yratio = (float)height / (float)frameheight;
-  for (int x = 0; x < framewidth; ++x) {
-    for (int y = 0; y < frameheight; ++y) {
-      framepixels[x + y * framewidth] = *GetPixel(x * xratio,
-                                                  y * yratio);
-    }
-  }
-
-  //memcpy(framepixels, pixels, sizeof(Pixel) * framewidth * frameheight);
-  fwrite(framepixels, sizeof(Pixel) * framewidth * frameheight, 1, _ffmpeg);
-  //fwrite(pixels, sizeof(Pixel) * width * height, 1, _ffmpeg);
-}
-
 // Main function.
 int main(int _argc, char** _argv) {
   // Get the command line arguments
@@ -292,38 +257,30 @@ int main(int _argc, char** _argv) {
   *GetPixel(cursorx, cursory) = cursorColor;
 
   // Run the irc bot
-  //ircuser = "bombpersonz";
-  //ircauth = "p4qwplmi4ul73ve6cxlhz8huyytufwe";
   ircuser = _argv[1];
   ircauth = _argv[2];
-  //"live_54987839_m5vBU41vOcS29EqRKBoLjjibdYTHL7"
   std::thread chatthread(runchat);
 
   // Start streaming =)
-  float fps = 15;
-  FILE* ffmpeg = GetFfmpegPipe(_argv[3],
-                               framewidth, frameheight, fps);
+  float fps = 24;
+  FILE* ffmpeg = GetFfmpegPipe(_argv[3], fps);
   if (ffmpeg == NULL)
     return 1;
 
   // Loop forever
-  clock_t oldticks = std::clock();
-  clock_t ticks = 0;
+  typedef std::chrono::high_resolution_clock Clock;
+  auto oldticks = Clock::now();
   while (true) {
-    // Update the timer
-    ticks += std::clock() - oldticks;
-    oldticks = std::clock();
-    float timer = (float)ticks / CLOCKS_PER_SEC;
+    float timer = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - oldticks).count() / 1000000000.0f;
 
-    // Get the input from chat. (locks the chat parser for a whilst we do this)
-    DoMovement();
-
-    // Write the frame if we have to.
+    // Write frames at the right timing.
     if (timer > 1.0f / fps) {
-      ticks = 0;
+      oldticks = Clock::now();
+
+      //MoveCursor(-1 + rand() % 3, -1 + rand() % 3);
 
       // Actually write the frame.
-      std::cout << "Writing frame..." << std::endl;
+      //std::cout << "Writing Frame..." << std::endl;
       WriteFrame(ffmpeg);
     }
   }
